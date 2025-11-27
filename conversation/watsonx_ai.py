@@ -76,53 +76,48 @@ class WatsonxAI:
             logger.warning("Watsonx.ai is not enabled, returning original response")
             return orchestrate_response
 
-        target_language = self._get_target_language(user_locale)
+        fallback_language = self._get_target_language_from_locale(user_locale)
         prompt = self._build_language_control_prompt(
             user_message,
             orchestrate_response,
-            target_language,
+            fallback_language,
         )
 
-        logger.info(f"Calling Watsonx.ai for language control to {target_language}")
+        logger.info("Calling Watsonx.ai for language control using user message language")
         logger.debug(f"Prompt: {prompt}")
 
         return self._generate_text(prompt)
 
-    def _get_target_language(self, locale: str) -> str:
-        """Determine target language from locale."""
+    def _get_target_language_from_locale(self, locale: str) -> str:
+        """Determine fallback target language from locale for English/Spanish only."""
         locale_lower = (locale or "").lower()
-        if locale_lower.startswith("es"):
-            return "Spanish"
-        elif locale_lower.startswith("en"):
+        if locale_lower.startswith("en"):
             return "English"
-        elif locale_lower.startswith("pt"):
-            return "Portuguese"
-        elif locale_lower.startswith("fr"):
-            return "French"
-        else:
-            return "Spanish"  # Default
+        return "Spanish"  # Default to Spanish when locale is missing or not English
 
     def _build_language_control_prompt(
         self,
         user_message: str,
         orchestrate_response: str,
-        target_language: str,
+        fallback_language: str,
     ) -> str:
-        """Build the prompt for language control."""
-        return f"""You are a language validator. Check if the response is in the correct language and return ONLY the response text.
+        """Build the prompt for language control using only English and Spanish."""
+        return f"""You are a bilingual (English/Spanish) language validator. Determine the language of the USER MESSAGE (only English or Spanish) and ensure the RESPONSE TO CHECK is returned in that same language.
 
 USER MESSAGE: {user_message}
 RESPONSE TO CHECK: {orchestrate_response}
-TARGET LANGUAGE: {target_language}
+FALLBACK LANGUAGE FROM LOCALE: {fallback_language}
 
 INSTRUCTIONS:
-- If response is already in {target_language}: return it EXACTLY as provided
-- If response is in wrong language: translate to {target_language}
-- Preserve ALL formatting, markdown, emojis, placeholders
-- Return ONLY the final response text
-- NO explanations, NO comments, NO meta-text
-- Do NOT add phrases like "Here is..." or "(The corrected..."
-- Do NOT explain what you did
+- Decide if USER MESSAGE is Spanish or English. If unclear, use the FALLBACK LANGUAGE FROM LOCALE.
+- If RESPONSE TO CHECK is already in the USER MESSAGE language: return it EXACTLY as provided.
+- If RESPONSE TO CHECK is in the other language: translate it to match the USER MESSAGE language.
+- Preserve ALL formatting, markdown, emojis, placeholders, variables, and quoted text.
+- Return ONLY the final response text.
+- NO explanations, NO comments, NO meta-text.
+- Do NOT add phrases like "Here is..." or "(The corrected...)".
+- Do NOT explain what you did.
+- Do NOT shorten or summarize; keep the full response intact.
 
 OUTPUT (response only):"""
 

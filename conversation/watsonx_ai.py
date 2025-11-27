@@ -76,7 +76,7 @@ class WatsonxAI:
             logger.warning("Watsonx.ai is not enabled, returning original response")
             return orchestrate_response
 
-        target_language = self._get_target_language(user_locale)
+        target_language = self._determine_target_language(user_message, user_locale)
         prompt = self._build_language_control_prompt(
             user_message,
             orchestrate_response,
@@ -86,9 +86,68 @@ class WatsonxAI:
         logger.info(f"Calling Watsonx.ai for language control to {target_language}")
         logger.debug(f"Prompt: {prompt}")
 
-        return self._generate_text(prompt)
+        primary_response = self._generate_text(prompt)
 
-    def _get_target_language(self, locale: str) -> str:
+        if not primary_response:
+            return None
+
+        primary_response = self._strip_prompt_artifacts(primary_response)
+
+        if self._is_in_target_language(primary_response, target_language):
+            return primary_response
+
+        translated = self._translate_with_retry(
+            text=primary_response,
+            target_language=target_language,
+        )
+        if translated and self._is_in_target_language(translated, target_language):
+            return translated
+
+        # Last-chance translation using the original orchestrate response
+        last_chance = self._translate_with_retry(
+            text=orchestrate_response,
+            target_language=target_language,
+        )
+        if last_chance and self._is_in_target_language(last_chance, target_language):
+            return last_chance
+
+        return last_chance or translated
+
+    def _determine_target_language(self, user_message: str, locale: str) -> str:
+        """
+        Decide the target language giving priority to the latest user message.
+
+        If we can detect the language from the message, we use that; otherwise we
+        fall back to the locale.
+        """
+        locale_language = self._get_target_language_from_locale(locale)
+        detected_code, detected_prob = self._detect_language_with_prob(user_message)
+        detected_language = self._language_name_from_code(detected_code) if detected_code else None
+
+        if self._has_spanish_markers(user_message):
+            if detected_language and detected_language != "Spanish":
+                logger.info(
+                    "Spanish markers found; overriding detected language '%s'",
+                    detected_language,
+                )
+            return "Spanish"
+
+        if detected_language:
+            if detected_language != locale_language:
+                logger.info(
+                    "Using detected language '%s' over locale '%s' (prob=%.2f)",
+                    detected_language,
+                    locale_language,
+                    detected_prob,
+                )
+            # If detection probability is weak, prefer locale as safer fallback.
+            if detected_prob < 0.70 and locale_language:
+                return locale_language
+            return detected_language
+
+        return locale_language
+
+    def _get_target_language_from_locale(self, locale: str) -> str:
         """Determine target language from locale."""
         locale_lower = (locale or "").lower()
         if locale_lower.startswith("es"):
@@ -101,6 +160,190 @@ class WatsonxAI:
             return "French"
         else:
             return "Spanish"  # Default
+
+    def _detect_language_from_text(self, text: str) -> Optional[str]:
+        """Detect language from free text using langdetect (best-effort)."""
+        code, _prob = self._detect_language_with_prob(text)
+        if not code:
+            return None
+        return self._language_name_from_code(code)
+
+    def _detect_language_with_prob(self, text: str) -> tuple[Optional[str], float]:
+        """Return language code and probability using langdetect."""
+        if not text or len(text.strip()) < 4:
+            return None, 0.0
+
+        try:
+            from langdetect import DetectorFactory, detect_langs
+        except ImportError:
+            logger.warning("langdetect not installed; skipping language detection")
+            return None, 0.0
+
+        try:
+            DetectorFactory.seed = 0  # deterministic detection
+            langs = detect_langs(text)
+            if not langs:
+                return None, 0.0
+            lang_code = langs[0].lang
+            prob = langs[0].prob
+            logger.debug(
+                "Detected language code '%s' (prob=%.2f) for text '%s'",
+                lang_code,
+                prob,
+                text[:50],
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Language detection failed: %s", exc)
+            return None, 0.0
+
+        return lang_code, prob
+
+    def _is_in_target_language(self, text: str, target_language: str) -> bool:
+        detected = self._detect_language_from_text(text)
+        if target_language.lower().startswith("spanish") and self._has_spanish_markers(text):
+            return True
+        if not detected:
+            return False
+        target_code = self._language_code_for_target(target_language)
+        if detected.lower() == target_language.lower():
+            return True
+        if target_code and detected.lower().startswith(target_code):
+            return True
+        return False
+
+    @staticmethod
+    def _language_code_for_target(target_language: str) -> Optional[str]:
+        return {
+            "spanish": "es",
+            "english": "en",
+            "portuguese": "pt",
+            "french": "fr",
+        }.get((target_language or "").lower())
+
+    def _language_name_from_code(self, code: str) -> Optional[str]:
+        return {
+            "es": "Spanish",
+            "en": "English",
+            "pt": "Portuguese",
+            "fr": "French",
+        }.get((code or "").lower())
+
+    @staticmethod
+    def _has_spanish_markers(text: str) -> bool:
+        lowered = (text or "").lower()
+        markers = [
+            "¿",
+            "¡",
+            " qué",
+            "cómo",
+            "por qué",
+            "ayuda",
+            "opciones",
+            "canales",
+            "ticket",
+        ]
+        return any(marker in lowered for marker in markers)
+
+    def _build_translation_prompt(self, text: str, target_language: str) -> str:
+        """Force a direct translation when the first pass missed the target language."""
+        lang_code = self._language_code_for_target(target_language) or target_language
+        return f"""Translate the following text to {target_language} (language code: {lang_code}).
+- Use ONLY {target_language}.
+- Do NOT include any text in other languages.
+- Preserve formatting/markdown/placeholders.
+- Do NOT summarize or omit any content.
+- If text is already in {target_language}, repeat it exactly.
+- Never return the source language if it differs from {target_language}.
+- Output format: \"{lang_code}: <translation>\"
+
+TEXT:
+{text}
+
+OUTPUT (translation only, with prefix):"""
+
+    def _build_strict_translation_prompt(self, text: str, target_language: str) -> str:
+        """Second translation attempt with stricter instructions."""
+        lang_code = self._language_code_for_target(target_language) or target_language
+        return f"""You are a translation engine. Translate the text inside <text></text> to {target_language} (language code: {lang_code}).
+- Answer ONLY with the translation in {target_language}.
+- Do NOT include any other language or commentary.
+- Preserve placeholders/formatting.
+- If text is already in {target_language}, repeat it exactly.
+- Never return the source language if it differs from {target_language}.
+- Output format: \"{lang_code}: <translation>\"
+
+<text>
+{text}
+</text>
+"""
+
+    def _build_example_translation_prompt(self, text: str, target_language: str) -> str:
+        """Third translation attempt with explicit examples."""
+        lang_code = self._language_code_for_target(target_language) or target_language
+        examples = ""
+        if target_language.lower().startswith("spanish"):
+            examples = """Examples:
+en: Hello! How are you? -> es: ¡Hola! ¿Cómo estás?
+en: I can create a ticket for you. -> es: Puedo crear un ticket para ti.
+en: Here are your options: view channels, create a ticket, or get help. -> es: Aquí están tus opciones: ver canales, crear un ticket o pedir ayuda."""
+        return f"""Translate to {target_language} (code: {lang_code}). Use ONLY {target_language}. If already in {target_language}, repeat it.
+- Format: \"{lang_code}: <translation>\"
+{examples}
+
+Text: {text}
+"""
+
+    def _translate_with_retry(self, text: str, target_language: str) -> Optional[str]:
+        """Attempt translation with two increasingly strict prompts."""
+        prompts = [
+            self._build_translation_prompt(text, target_language),
+            self._build_strict_translation_prompt(text, target_language),
+            self._build_example_translation_prompt(text, target_language),
+        ]
+        last_response: Optional[str] = None
+        for idx, prompt in enumerate(prompts, start=1):
+            translated = self._generate_text(prompt)
+            translated = self._strip_prompt_artifacts(translated)
+            if translated:
+                last_response = translated
+            if translated and self._is_in_target_language(translated, target_language):
+                return translated
+            logger.info(
+                "Translation attempt %s did not produce %s. Retrying...",
+                idx,
+                target_language,
+            )
+
+        return last_response or text
+
+    @staticmethod
+    def _strip_prompt_artifacts(text: Optional[str]) -> Optional[str]:
+        if not text:
+            return text
+        clean_text = text
+        markers = (
+            "\nTEXT:",
+            "\nINPUT:",
+            "\nOUTPUT (translation only):",
+            "\nOUTPUT (translation only, with prefix):",
+            "\n[Answer]",
+            "\n[FORMATTED_SPANISH]",
+        )
+        for marker in markers:
+            idx = clean_text.find(marker)
+            if idx != -1:
+                clean_text = clean_text[:idx]
+        clean_text = clean_text.strip()
+        return WatsonxAI._strip_language_prefix(clean_text)
+
+    @staticmethod
+    def _strip_language_prefix(text: str) -> str:
+        lowered = text.lower()
+        prefixes = ("es:", "en:", "pt:", "fr:", "spanish:", "english:", "portuguese:", "french:")
+        for prefix in prefixes:
+            if lowered.startswith(prefix):
+                return text[len(prefix) :].lstrip()
+        return text
 
     def _build_language_control_prompt(
         self,
@@ -119,6 +362,7 @@ INSTRUCTIONS:
 - If response is already in {target_language}: return it EXACTLY as provided
 - If response is in wrong language: translate to {target_language}
 - Preserve ALL formatting, markdown, emojis, placeholders
+- Do NOT shorten, summarize, or omit content
 - Return ONLY the final response text
 - NO explanations, NO comments, NO meta-text
 - Do NOT add phrases like "Here is..." or "(The corrected..."

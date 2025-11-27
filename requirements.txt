@@ -7,3 +7,4 @@ botbuilder-core==4.17.0
 python-dotenv
 ibm-watsonx-ai>=1.0.0
 ibm-cloud-sdk-core>=3.16.0
+langdetect==1.0.9

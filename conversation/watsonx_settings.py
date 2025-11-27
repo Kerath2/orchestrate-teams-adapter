@@ -1,11 +1,11 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 
 @dataclass
 class WatsonxSettings:
     """Configuration settings for IBM Watsonx Orchestrate integration."""
-    api_key: str = os.getenv("WATSONX_ORCHESTRATE_API_KEY", "")
-    base_url: str = os.getenv("WATSONX_ORCHESTRATE_URL", "")
-    agent_id: str = os.getenv("WATSONX_ORCHESTRATE_AGENT_ID", "")
-    token_url: str = os.getenv("WATSONX_TOKEN_URL", "https://iam.cloud.ibm.com/identity/token")
-    token_expiration_buffer: int = int(os.getenv("WATSONX_TOKEN_EXPIRATION_BUFFER", "60"))
+    api_key: str = field(default_factory=lambda: os.getenv("WATSONX_ORCHESTRATE_API_KEY", ""))
+    base_url: str = field(default_factory=lambda: os.getenv("WATSONX_ORCHESTRATE_URL", ""))
+    agent_id: str = field(default_factory=lambda: os.getenv("WATSONX_ORCHESTRATE_AGENT_ID", ""))
+    token_url: str = field(default_factory=lambda: os.getenv("WATSONX_TOKEN_URL", "https://iam.cloud.ibm.com/identity/token"))
+    token_expiration_buffer: int = field(default_factory=lambda: int(os.getenv("WATSONX_TOKEN_EXPIRATION_BUFFER", "60")))
